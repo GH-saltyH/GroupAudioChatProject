@@ -17,12 +17,6 @@
 static std::atomic<bool> gRunning{ true };
 
 // -------------------------------------------
-// 멀티스레드에서 동시에 gClients 벡터를 접근할 수 있으므로
-// mutex로 보호한다
-// -------------------------------------------
-static std::mutex gClientMutex;
-
-// -------------------------------------------
 // 클라이언트 엔트리
 //  1. 각 클라이언트 별 송신 전용 큐 / 스레드를 보유
 //  2. 느린 클리이언트가 있어도 다른 클라이언트로의 송신은 지연되지 않는다
@@ -30,33 +24,35 @@ static std::mutex gClientMutex;
 struct ClientInfo
 {
     SOCKET sock = INVALID_SOCKET;
-
     // 송신 전용 큐
     std::mutex qMutex;
     std::condition_variable qCV;
-
     // 공유 포인터로 패킷을 보관하여 불필요한 복사를 줄인다
     std::queue<std::shared_ptr<std::vector<char>>> q;
-
     // 송신 스레드
     std::thread sendThread;
-
     // 활성 상태
     std::atomic<bool> active{ true };
-
     // 백프레셔 카운터 (무한 메모리 증가 방지용) - 단순 프레임 수 제한
     size_t queuedFrames = 0;
 };
 
 static std::vector<std::shared_ptr<ClientInfo>> gClients;
-
 // -------------------------------------------
-// 상수 설정
+// 멀티스레드에서 동시에 gClients 벡터를 접근할 수 있으므로
+// mutex로 보호한다
 // -------------------------------------------
+static std::mutex gClientMutex;
 
-// 너무 느린 클라이언트 보호 : 큐에 쌓일 수 있는 최대 프레임 수 
-// (20ms 프레임 기준 50개면 약 1초 분량)
-#define MAX_QUEUE_FRAMES 50
+// ---------------------------
+// 믹싱 큐
+// ---------------------------
+struct MixFrame
+{
+    std::vector<char> data;                 // 16bit stereo PCM
+};
+static std::mutex gMixMutex;
+static std::vector<MixFrame> gMixFrames;
 
 // -------------------------------------------
 // 소켓 옵션 보조 함수
@@ -82,20 +78,16 @@ static void TuneSocket(SOCKET s)
 // -------------------------------------------
 static void RemoveClient(const std::shared_ptr<ClientInfo>& cli)
 {
-    if (!cli)
+    // 이미 종료된 경우 중복 방지
+    if (!cli || !cli->active.exchange(false))
         return;
     
-    // 이미 종료된 경우 중복 방지
-    if (!cli->active.exchange(false))
-        return;
-
     // 1. 활성 플래그 내리고 대기 깨우기
     //cli->active = false;
     {
         std::lock_guard<std::mutex> lock(cli->qMutex);
         while (!cli->q.empty()) cli->q.pop();
         cli->queuedFrames = 0;
-
     }
     cli->qCV.notify_all();
 
@@ -114,23 +106,16 @@ static void RemoveClient(const std::shared_ptr<ClientInfo>& cli)
     // 4. gClients 에서 제거
     {
         std::lock_guard<std::mutex> glock(gClientMutex);
-        auto it = std::find(gClients.begin(), gClients.end(), cli);
+
+        gClients.erase(std::remove(gClients.begin(), gClients.end(), cli), gClients.end());
+
+        /*auto it = std::find(gClients.begin(), gClients.end(), cli);
         if (it != gClients.end())
-            gClients.erase(it);
+            gClients.erase(it);*/
     }
 
     std::cout << "[서버] 클라이언트 제거 완료 (잔여 " << gClients.size() << "명)" << std::endl;
 }
-//static void RemoveClient(SOCKET s)
-//{
-//    std::lock_guard<std::mutex> lock(gClientMutex);
-//    auto it = std::find(gClients.begin(), gClients.end(), s);
-//    if (it != gClients.end())
-//    {
-//        closesocket(*it);
-//        gClients.erase(it);
-//    }
-//}
 
 // -------------------------------------------
 // ClientSendThread
@@ -171,60 +156,6 @@ static void ClientSendThread(std::shared_ptr<ClientInfo> cli)
 }
 
 // -------------------------------------------
-// BroadcastAudio
-//  1. 하나의 프레임을 모든 클라이언트의 송신 큐에 push
-//  2. 느린 클라이언트는 큐가 가득 차면 가장 오래된 프레임을 drop
-//     (실시간 음성 특성상 오래된 프레임을 보낼 이유가 없다)
-// -------------------------------------------
-static void BroadcastAudio(SOCKET /*sender*/, const char* buf, int len)
-{
-    // 1. 패킷 공유 포인터 (복사 최소화)
-    auto packet = std::make_shared<std::vector<char>>(buf, buf + len);
-
-    // 2. 모든 클라이언트 큐에 push
-    std::lock_guard<std::mutex> glock(gClientMutex);
-    for (auto& cli : gClients)
-    {
-        if (!cli->active)
-			continue;
-
-        std::lock_guard<std::mutex> glock(cli->qMutex);
-
-        // 백프레셔 : 큐가 가득 차면 가장 오래된 프레임 drop
-        while (cli->queuedFrames >= MAX_QUEUE_FRAMES && !cli->q.empty())
-        {
-            cli->q.pop();
-            cli->queuedFrames--;
-        }
-
-        cli->q.push(packet);
-        cli->queuedFrames++;
-        cli->qCV.notify_one();
-	}
-}
-//static void BroadcastAudio(SOCKET sender, const char* buf, int len)
-//{
-//    std::vector<SOCKET> bad;
-//
-//    {
-//        std::lock_guard<std::mutex> lock(gClientMutex);
-//        for (SOCKET c : gClients)
-//        {
-//            // 송신 실패 시, 해당 소켓은 이후 제거 대상에 추가시킨다
-//            if (!sendFrame(c, buf, (uint32_t)len))
-//                bad.push_back(c);
-//        }
-//    }
-//
-//    // 실패한 소켓을 실제 제거 시키는 처리를 한다
-//    for (SOCKET b : bad)
-//    {
-//        std::cerr << "[서버] 전송 실패 클라이언트 제거" << std::endl;
-//        RemoveClient(b);
-//    }
-//}
-
-// -------------------------------------------
 // ClientRecvThread
 //  1. 클라이언트가 보낸 오디오 프레임을 수신
 //  2. BroadcastAudio 로 전체에게 송신
@@ -232,7 +163,6 @@ static void BroadcastAudio(SOCKET /*sender*/, const char* buf, int len)
 static void ClientRecvThread(std::shared_ptr<ClientInfo> cli)
 {
     std::vector<char> frame;
-
     while (gRunning && cli->active)
     {
         if (!recvFrame(cli->sock, frame))
@@ -241,28 +171,119 @@ static void ClientRecvThread(std::shared_ptr<ClientInfo> cli)
             break;
         }
 
-        // 수신 프레임을 전체에게 브로드 캐스트
-        BroadcastAudio(cli->sock, frame.data(), (int)frame.size());
+        // 믹스 프레임 수신
+        MixFrame mf;
+        mf.data = frame;
+        {
+            std::lock_guard<std::mutex> lock(gMixMutex);
+            gMixFrames.push_back(std::move(mf));
+        }
+        
+        //// 수신 프레임을 전체에게 브로드 캐스트
+        //BroadcastAudio(cli->sock, frame.data(), (int)frame.size());
     }
 
     // 수신 종료 시 제거
     RemoveClient(cli);
 }
-//static void ClientThread(SOCKET s)
+
+// -------------------------------------------
+// MixerThread
+//  1. 클라이언트가 보낸 오디오를 믹싱
+// -------------------------------------------
+static void MixerThread()
+{
+    const int FRAME_SIZE = AUDIO_BUFFER_SIZE;   // 20ms PCM
+    const int NUM_CHANNELS = 2;
+
+    while (gRunning)
+    {
+        std::vector<MixFrame> framesToMix;
+
+        {
+            std::lock_guard<std::mutex> lock(gMixMutex);
+            if (gMixFrames.empty())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+            framesToMix.swap(gMixFrames);
+        }
+
+        // mix
+        std::vector<char> mixed(FRAME_SIZE, 0);
+        for (auto& f : framesToMix)
+        {
+            for (size_t i = 0; i < FRAME_SIZE; i += 2)
+            {
+                short* dst = (short*)&mixed[i];
+                short* src = (short*)&f.data[i];
+                int s = *dst + *src;
+
+                if (s > 32767)
+                    s = 32767;
+
+                if (s < -32768)
+                    s = -32768;
+
+                *dst = (short)s;
+            }
+        }
+
+        // 모든 클라이언트에 push
+        std::lock_guard<std::mutex> glock(gClientMutex);
+        for (auto& cli : gClients)
+        {
+            if (!cli->active)
+                continue;
+
+            std::lock_guard<std::mutex> lock(cli->qMutex);
+            while (cli->queuedFrames >= MAX_QUEUE_FRAMES && !cli->q.empty())
+            {
+                cli->q.pop();
+                cli->queuedFrames--;
+            }
+
+            cli->q.push(std::make_shared<std::vector<char>>(mixed));
+            cli->queuedFrames++;
+            cli->qCV.notify_one();
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+// -------------------------------------------
+// BroadcastAudio
+//  1. 하나의 프레임을 모든 클라이언트의 송신 큐에 push
+//  2. 느린 클라이언트는 큐가 가득 차면 가장 오래된 프레임을 drop
+//     (실시간 음성 특성상 오래된 프레임을 보낼 이유가 없다)
+// -------------------------------------------
+//static void BroadcastAudio(SOCKET sender, const char* buf, int len)
 //{
-//    std::vector<char> frame;
-//    while (gRunning)
+//    // 1. 패킷 공유 포인터 (복사 최소화)
+//    auto packet = std::make_shared<std::vector<char>>(buf, buf + len);
+//
+//    // 2. 모든 클라이언트 큐에 push
+//    std::lock_guard<std::mutex> glock(gClientMutex);
+//    for (auto& cli : gClients)
 //    {
-//        // recvFrame: TCP 스트림에서 
-//        // [4바이트 길이][데이터] 구조로된 데이터를 해석한다
-//        if (!recvFrame(s, frame))
-//            break;
+//        if (!cli->active)
+//			continue;
 //
-//        BroadcastAudio(s, frame.data(), (int)frame.size());
-//    }
+//        std::lock_guard<std::mutex> lock(cli->qMutex);
 //
-//    std::cout << "[서버] 클라이언트 연결 종료" << std::endl;
-//    RemoveClient(s);
+//        // 백프레셔 : 큐가 가득 차면 가장 오래된 프레임 drop
+//        while (cli->queuedFrames >= MAX_QUEUE_FRAMES && !cli->q.empty())
+//        {
+//            cli->q.pop();
+//            cli->queuedFrames--;
+//        }
+//
+//        cli->q.push(packet);
+//        cli->queuedFrames++;
+//        cli->qCV.notify_one();
+//	}
 //}
 
 // -------------------------------------------
@@ -343,6 +364,9 @@ int main()
 
     std::cout << "[오디오 서버] 포트" << PORT << " 수신 대기" << std::endl;
 
+    // ** 믹서 스레드 등록
+    std::thread mixer(MixerThread);
+
     // 6. 메인 루프 : 새로운 클라이언트 accept
     while (gRunning)
     {
@@ -376,118 +400,21 @@ int main()
     }
 
     // 7. 종료 처리: 모든 클라이언트 소켓/스레드 닫기
-    {
-        std::vector<std::shared_ptr<ClientInfo>> snapshot;
-        {
-            std::lock_guard<std::mutex> glock(gClientMutex);
-            snapshot = gClients;        // 복사하여 락을 짧게 유지
-        }
-        for(auto& cli : snapshot)
-        {
-            RemoveClient(cli);
-		}
-    }
+  //  {
+  //      std::vector<std::shared_ptr<ClientInfo>> snapshot;
+  //      {
+  //          std::lock_guard<std::mutex> glock(gClientMutex);
+  //          snapshot = gClients;        // 복사하여 락을 짧게 유지
+  //      }
+  //      for(auto& cli : snapshot)
+  //      {
+  //          RemoveClient(cli);
+		//}
+  //  }
 
+    mixer.join();
     closesocket(listenSock);
     WSACleanup();
     std::cout << "[서버] 정상 종료" << std::endl;
     return 0;
 }
-//int main()
-//{
-//    std::cout << "// ───────────────────────────────" << std::endl;
-//    std::cout << "// 비압축 Wave 형식의 오디오 송수신 프로그램 [ 서버 ]" << std::endl;
-//    std::cout << "//    * 형식 *PCM, 2ch, 48000kHz, 16bit" << std::endl;
-//    std::cout << "//    * 현재서버 주소" << std::endl << "//        [" << SERVER_IP << "]" << std::endl;
-//    std::cout << "//    * Author" << std::endl << "//        [Dev.Shhyun@gmail.com]" << std::endl;
-//    std::cout << "//    * Date" << std::endl << "//        [2025-08-23]" << std::endl;
-//    std::cout << "// ───────────────────────────────" << std::endl << std::endl;
-//
-//    // 1. Winsock 초기화
-//    WSADATA wsa{};
-//    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
-//    {
-//        std::cerr << "[서버] WSAStartup 실패" << std::endl;
-//        return 1;
-//    }
-//
-//    // 2. Ctrl+C 처리 핸들러 등록
-//    std::signal(SIGINT, SignalHandler);
-//
-//    // 3. 리슨 소켓 생성
-//    SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-//    if (listenSock == INVALID_SOCKET)
-//    {
-//        std::cerr << "[서버] socket 실패" << std::endl;
-//        WSACleanup();
-//        return 1;
-//    }
-//
-//    // (옵션) 빠른 재시작을 위한 SO_REUSEADDR  = allow local address reuse 설정
-//    int yes = 1;
-//    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
-//
-//    // 4. Bind : 서버 주소와 포트를 지정한다
-//    sockaddr_in addr{};
-//    addr.sin_family = AF_INET;
-//    addr.sin_port = htons(PORT);
-//    addr.sin_addr.s_addr = INADDR_ANY;
-//
-//    if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
-//    {
-//        std::cerr << "[서버] bind 실패: " << WSAGetLastError() << std::endl;
-//        closesocket(listenSock);
-//        WSACleanup();
-//        return 1;
-//    }
-//
-//    // 5. Listen 상태 진입 ( 동시 접속 허용 처리)
-//    if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR)
-//    {
-//        std::cerr << "[서버] listen 실패: " << WSAGetLastError() << std::endl;
-//        closesocket(listenSock);
-//        WSACleanup();
-//        return 1;
-//    }
-//
-//    std::cout << "[오디오 서버] 포트 " << PORT << " 수신 대기" << std::endl;
-//
-//    // 6. 메인 루프: 새로운 클라이언트 accept
-//    while (gRunning)
-//    {
-//        SOCKET s = accept(listenSock, nullptr, nullptr);
-//        if (s == INVALID_SOCKET)
-//        {
-//            if (!gRunning)
-//                break;
-//
-//            std::cerr << "[서버] accept 실패: " << WSAGetLastError() << std::endl;
-//            continue;
-//        }
-//
-//        {
-//            std::lock_guard<std::mutex> lock(gClientMutex);
-//            gClients.push_back(s);
-//        }
-//
-//        // 클라이언트 별로 전용 스레드를 생성하여 처리한다
-//        std::thread(ClientThread, s).detach();
-//        std::cout << "[서버] 클라이언트 접속" << std::endl;
-//    }
-//
-//    // 7. 종료 처리: 모든 클라이언트 소켓 닫기
-//    {
-//        std::lock_guard<std::mutex> lock(gClientMutex);
-//        for (SOCKET s : gClients)
-//        {
-//            shutdown(s, SD_BOTH);
-//            closesocket(s);
-//        }
-//        gClients.clear();
-//    }
-//
-//    closesocket(listenSock);
-//    WSACleanup();
-//    std::cout << "[서버] 정상 종료" << std::endl;
-//    return 0;
-//}
