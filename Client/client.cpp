@@ -14,6 +14,17 @@ static HWAVEIN gWaveIn = nullptr;                             // 캡처 장치�
 static HWAVEOUT gWaveOut = nullptr;                       // 재생 장치의 핸들러
 
 // ───────────────────────────────
+// 클라이언트 동작 모드
+//   - Normal : 실제 오디오 입출력 사용
+//   - Test   : 무음 송신 + 무출력 (다중 실행 시 장치 충돌 방지)
+// ───────────────────────────────
+enum class ClientMode { 
+    Normal, 
+    Test 
+};
+static ClientMode gMode = ClientMode::Normal;
+
+// ───────────────────────────────
 // 송신 큐 (캡처 → 네트워크 송신 파이프라인)
 // ───────────────────────────────
 static std::mutex gSendMutex;
@@ -108,7 +119,7 @@ static void StopCapture(HWAVEIN hIn)
 static void CALLBACK waveInProc(HWAVEIN hwi, UINT msg, DWORD_PTR inst, DWORD_PTR param1, DWORD_PTR param2)
 {
     // 1. WIM_DATA 메시지 및 실행 상태 확인
-    if (msg != WIM_DATA || !gRunning)
+    if (msg != WIM_DATA || !gRunning || gMode == ClientMode::Test)
         return;
 
     // 2.  TCP 송신 큐에 복사
@@ -136,6 +147,28 @@ static void CALLBACK waveInProc(HWAVEIN hwi, UINT msg, DWORD_PTR inst, DWORD_PTR
 // ───────────────────────────────
 static void SendThread()
 {
+    // ─────────────────
+    // Test 모드 : 무음 패킷 주기적으로 송신
+    // ─────────────────
+    if (gMode == ClientMode::Test)
+    {
+        std::vector<char> silence(AUDIO_BUFFER_SIZE, 0);
+        while (gRunning)
+        {
+            if (!sendFrame(gSock, silence.data(), (uint32_t)silence.size()))
+            {
+                std::cerr << "서버 송신 실패 (test 모드)" << std::endl;
+                gRunning = false;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return;
+    }
+
+    // ─────────────────
+    // Normalt 모드 : 큐에서 패킷을 꺼내 전송
+    // ─────────────────
     while (gRunning)
     {
         // 1. 큐에서 패킷 대기
@@ -179,6 +212,10 @@ static void RecvThread()
             break;
         }
 
+        // test 모드인 경우 재생하지 않고 discard 
+        if (gMode == ClientMode::Test)
+            continue;
+
         // 2. 재생용 동적 버퍼를 준비한다
         WAVEHDR* hdr = new WAVEHDR();
         ZeroMemory(hdr, sizeof(WAVEHDR));
@@ -209,6 +246,9 @@ static void RecvThread()
 // ───────────────────────────────
 static bool StartCapture()
 {
+    if(gMode == ClientMode::Test)
+		return true;
+
     // 1. WAVEFORMATEX 설정 (PCM, 48kHz, 16bit, 스테리오 타입)
     WAVEFORMATEX fmt{};
     {
@@ -223,7 +263,8 @@ static bool StartCapture()
     // 2. 캡처 장치 열기
     {
         MMRESULT r = waveInOpen(&gWaveIn, WAVE_MAPPER, &fmt, (DWORD_PTR)waveInProc, 0, CALLBACK_FUNCTION);
-        if (r != MMSYSERR_NOERROR) {
+        if (r != MMSYSERR_NOERROR) 
+        {
             std::cerr << "waveInOpen 실패" << std::endl;
             return false;
         }
@@ -234,10 +275,8 @@ static bool StartCapture()
     {
         WAVEHDR* hdr = new WAVEHDR();
         ZeroMemory(hdr, sizeof(WAVEHDR));
-        {
-            hdr->lpData = new char[AUDIO_BUFFER_SIZE];
-            hdr->dwBufferLength = AUDIO_BUFFER_SIZE;
-        }
+        hdr->lpData = new char[AUDIO_BUFFER_SIZE];
+        hdr->dwBufferLength = AUDIO_BUFFER_SIZE;
 
         // 캡처 장치에 등록하고 관리 리스트에 추가
         RegisterBuffer(gWaveIn, hdr);
@@ -255,6 +294,9 @@ static bool StartCapture()
 // ───────────────────────────────
 static bool InitPlayback()
 {
+    if (gMode == ClientMode::Test)
+        return true;    // 장치 열지 않음
+
     // 1. WAVEFORMATEX 설정 (PCM, 48kHz, 16bit, 스테레오)
     WAVEFORMATEX fmt{};
     {
@@ -287,15 +329,22 @@ static bool InitPlayback()
 // 4. 송신/수신 스레드 실행
 // 5. 엔터 입력 → 안전 종료
 // ───────────────────────────────
-int main()
+int main(int argc, char* argv[])
 {
     std::cout << "// ───────────────────────────────" << std::endl;
     std::cout << "// 비압축 Wave 형식의 오디오 송수신 프로그램 [ 클라이언트 ]" << std::endl;
     std::cout << "//    * 형식 *PCM, 2ch, 48000kHz, 16bit" << std::endl;
     std::cout << "//    * 현재서버 주소" << std::endl << "//        [" << SERVER_IP << "]" << std::endl;
     std::cout << "//    * Author" << std::endl << "//        [Dev.Shhyun@gmail.com]" << std::endl;
-    std::cout << "//    * Date" << std::endl << "//        [2025-08-23]" << std::endl;
+    std::cout << "//    * Date" << std::endl << "//        [2025-08-25]" << std::endl;
     std::cout << "// ───────────────────────────────" << std::endl << std::endl;
+
+    // 실행 인자 확인 → test 모드
+    if (argc > 1 && std::string(argv[1]) == "test")
+    {
+        gMode = ClientMode::Test;
+        std::cout << "[system] Test 모드 활성화 : 무음 송신 / 무출력" << std::endl;
+    }
 
     // 1. Winsock 초기화
     {
