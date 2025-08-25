@@ -1,6 +1,6 @@
 ﻿// =============================
 //      client.cpp 
-//      Date : 2025-08-23
+//      Date : 2025-08-25 (Refactored)
 //      Author : Dev.seunhak
 // =============================
 #include "../core/core.h"
@@ -317,6 +317,13 @@ int main()
             std::cerr << "[system] 서버 연결 실패" << std::endl;
             return -1;
         }
+
+        // ───────────────────────────────
+        // 지연 최적화 (선택) : Nagle 비활성화
+        // ───────────────────────────────
+        int flag = 1;
+        setsockopt(gSock, IPPROTO_TCP, TCP_NODELAY, (const char*)&flag, sizeof(flag));
+
         std::cout << "[system] 서버 연결 성공" << std::endl;
     }
 
