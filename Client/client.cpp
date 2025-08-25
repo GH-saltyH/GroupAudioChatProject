@@ -25,11 +25,31 @@ enum class ClientMode {
 static ClientMode gMode = ClientMode::Normal;
 
 // ───────────────────────────────
+// 상수 설정 (백프레셔)
+//  - 20ms 프레임 기준 50개이면 약 1초 분량
+// ───────────────────────────────
+#define MAX_SEND_QUEUE_FRAMES  50
+#define MAX_PLAY_QUEUE_FRAMES  50
+
+// ───────────────────────────────
 // 송신 큐 (캡처 → 네트워크 송신 파이프라인)
 // ───────────────────────────────
 static std::mutex gSendMutex;
 static std::condition_variable gSendCV;
 static std::queue<std::vector<char>> gSendQueue;
+// 백프레셔 카운터
+static size_t gSendQueuedFrames = 0;
+
+// ───────────────────────────────
+// 재생 큐 (수신 → 오디오 출력 파이프라인)
+//   - RecvThread 는 네트워크에서 받은 프레임을 빠르게 push
+//   - 별도의 PlaybackThread 가 waveOutWrite 를 수행
+//   - waveOutWrite 가 내부적으로 대기해도 RecvThread 가 막히지 않음
+// ───────────────────────────────
+static std::mutex gPlayMutex;
+static std::condition_variable gPlayCV;
+static std::queue<std::vector<char>> gPlayQueue;
+static size_t gPlayQueuedFrames = 0; // 백프레셔 카운트
 
 // ───────────────────────────────
 // 버퍼 관리 리스트 (main.h 에 추가했던 것)
@@ -116,7 +136,7 @@ static void StopCapture(HWAVEIN hIn)
 // 2. TCP 송신 큐에 패킷 복사 :  dwBytesRecorded 크기만큼 TCP 송신 큐에 push
 // 3. 버퍼 재등록 : waveInAddBuffer로 재등록 (순환 버퍼)
 // ───────────────────────────────
-static void CALLBACK waveInProc(HWAVEIN hwi, UINT msg, DWORD_PTR inst, DWORD_PTR param1, DWORD_PTR param2)
+static void CALLBACK waveInProc(HWAVEIN hwi, UINT msg, DWORD_PTR inst, DWORD_PTR param1, DWORD_PTR /*param2*/)
 {
     // 1. WIM_DATA 메시지 및 실행 상태 확인
     if (msg != WIM_DATA || !gRunning || gMode == ClientMode::Test)
@@ -127,9 +147,22 @@ static void CALLBACK waveInProc(HWAVEIN hwi, UINT msg, DWORD_PTR inst, DWORD_PTR
         WAVEHDR* hdr = (WAVEHDR*)param1;
         if (hdr->dwBytesRecorded > 0)
         {
-            std::vector<char> packet(hdr->lpData, hdr->lpData + hdr->dwBytesRecorded);
+            // 리펙터링으로 블록 std::vector<char> packet(hdr->lpData, hdr->lpData + hdr->dwBytesRecorded);
+            /*gSendQueue.push(std::move(packet));
+            gSendCV.notify_one();*/
             std::lock_guard<std::mutex> lock(gSendMutex);
-            gSendQueue.push(std::move(packet));
+
+            // 리펙터링으로 추가
+            // 백 프레셔 :: 큐가 가득 차면 가장 오래된 프레임 drop
+            while (gSendQueuedFrames >= MAX_SEND_QUEUE_FRAMES && !gSendQueue.empty())
+            {
+                gSendQueue.pop();
+                gSendQueuedFrames--;               
+            }
+
+            // 리펙터링 추가
+            gSendQueue.emplace(hdr->lpData, hdr->lpData + hdr->dwBytesRecorded);
+            gSendQueuedFrames++;
             gSendCV.notify_one();
         }
 
@@ -180,6 +213,12 @@ static void SendThread()
         // 2. 패킷을 꺼낸다
         auto packet = std::move(gSendQueue.front());
         gSendQueue.pop();
+        
+        // 리펙터링으로 추가
+        // 백프레셔 카운트 감소 
+        if (gSendQueuedFrames > 0)
+            gSendQueuedFrames--;
+
         lock.unlock();
 
         // 3. 서버로 전송한다
@@ -194,7 +233,7 @@ static void SendThread()
 
 // ───────────────────────────────
 // [스레드] RecvThread
-// 서버로부터 오디오 프레임을 수신하고 재생한다.
+// 서버로부터 오디오 프레임을 수신하고    재생한다.
 // 1. 서버에서 프레임 수신 : recvFrame: TCP에서 [길이][데이터] 형태로 안전 수신
 // 2. 재생용 버퍼 준비 : 수신 후 동적 버퍼에 복사하여 waveOutWrite 호출
 // 3. 재생 및 재생 후 안전 해제 : 재생이 끝나면 스레드에서 polling 하여 메모리 해제
@@ -215,6 +254,75 @@ static void RecvThread()
         // test 모드인 경우 재생하지 않고 discard 
         if (gMode == ClientMode::Test)
             continue;
+        
+        // ───────────────────────────────
+        // 중요 :: Recv → Play 를 분리
+        //  - 재생 큐에 push 후 PlaybackThread 가 waveOutWrite 수행
+        //  - 백프레셔 : 가득 차면 가장 오래된 프레임 drop
+        // ───────────────────────────────
+        {
+            std::lock_guard<std::mutex> lock(gPlayMutex);
+
+            while (gPlayQueuedFrames >= MAX_PLAY_QUEUE_FRAMES && !gPlayQueue.empty())
+            {
+                gPlayQueue.pop();
+                gPlayQueuedFrames--;
+            }
+
+            gPlayQueue.emplace(std::move(buf));
+            gPlayQueuedFrames++;
+            gPlayCV.notify_one();
+        }
+        
+        // Refactoring 
+        // Play 분리로 인해 제거
+        //// 2. 재생용 동적 버퍼를 준비한다
+        //WAVEHDR* hdr = new WAVEHDR();
+        //ZeroMemory(hdr, sizeof(WAVEHDR));
+        //hdr->lpData = new char[buf.size()];
+        //memcpy(hdr->lpData, buf.data(), buf.size());
+        //hdr->dwBufferLength = (DWORD)buf.size();
+
+        //waveOutPrepareHeader(gWaveOut, hdr, sizeof(WAVEHDR));
+        //waveOutWrite(gWaveOut, hdr, sizeof(WAVEHDR));
+
+        //// 3. 중요 :: 힙 제거 안전 코드 :: 재생이 끝날 떄까지 대기 후 메모리를 해제한다 
+        //std::thread([hdr] {
+        //    while (!(hdr->dwFlags & WHDR_DONE)) Sleep(5);
+        //    waveOutUnprepareHeader(gWaveOut, hdr, sizeof(WAVEHDR));
+        //    delete[] hdr->lpData;
+        //    delete hdr;
+        //    }).detach();
+    }
+}
+
+// Refactoring 으로 추가 (recv → play 분리)
+// ───────────────────────────────
+// [스레드] PlaybackThread
+//  - 재생 큐에서 프레임을 꺼내 waveOutWrite 수행
+//  - waveOutWrite 가 내부적으로 대기해도 RecvThread 는 영향을 받지 않는다
+// ───────────────────────────────
+static void PlaybackThread()
+{
+    if (gMode == ClientMode::Test)
+        return;             // Test 모드인 경우 재생하지 않음
+
+    while (gRunning)
+    {
+        std::vector<char> buf;
+
+        // 1. 큐에서 프레임 대기
+        {
+            std::unique_lock<std::mutex> lock(gPlayMutex);
+            gPlayCV.wait(lock, [] { return !gPlayQueue.empty() || !gRunning; });
+            if (!gRunning)
+                break;
+
+            buf = std::move(gPlayQueue.front());
+            gPlayQueue.pop();
+            if (gPlayQueuedFrames > 0)
+                gPlayQueuedFrames--;
+        }
 
         // 2. 재생용 동적 버퍼를 준비한다
         WAVEHDR* hdr = new WAVEHDR();
@@ -226,12 +334,13 @@ static void RecvThread()
         waveOutPrepareHeader(gWaveOut, hdr, sizeof(WAVEHDR));
         waveOutWrite(gWaveOut, hdr, sizeof(WAVEHDR));
 
-        // 3. 중요 :: 힙 제거 안전 코드 :: 재생이 끝날 떄까지 대기 후 메모리를 해제한다 
-        std::thread([hdr] {
-            while (!(hdr->dwFlags & WHDR_DONE)) Sleep(5);
-            waveOutUnprepareHeader(gWaveOut, hdr, sizeof(WAVEHDR));
-            delete[] hdr->lpData;
-            delete hdr;
+        // 3. 중요 : 힙 제거 안전 코드 : 재생이 끝날 때까지 대기 후 메모리 해제
+        std::thread([hdr]
+            {
+                while (!(hdr->dwFlags & WHDR_DONE)) Sleep(5);
+                waveOutUnprepareHeader(gWaveOut, hdr, sizeof(WAVEHDR));
+                delete[] hdr->lpData;
+                delete hdr;
             }).detach();
     }
 }
@@ -389,6 +498,11 @@ int main(int argc, char* argv[])
         std::thread tSend(SendThread);
         std::thread tRecv(RecvThread);
 
+        // 리펙터링으로 추가
+        std::thread tPlay;
+        if(gMode != ClientMode::Test)
+            tPlay = std::thread(PlaybackThread);
+
         // 5. 안전 종료 ( 엔터 입력 대기 )
         std::cout << "[system] 음성 채팅 클라이언트 실행 중. 엔터 입력 시 종료" << std::endl;
         std::string dummy;
@@ -396,6 +510,8 @@ int main(int argc, char* argv[])
 
         gRunning = false;
         gSendCV.notify_all();
+        // 리펙터링으로 추가
+        gPlayCV.notify_all();
 
         StopCapture(gWaveIn);
         if (gWaveOut)
@@ -405,6 +521,23 @@ int main(int argc, char* argv[])
 
         tSend.join();
         tRecv.join();
+
+        // 리펙터링으로 추가
+        if (tPlay.joinable())
+            tPlay.join();
+
+        // 리펙터링으로 추가
+        // 큐 비우기 (종료 시 청소)
+        {
+            std::lock_guard<std::mutex> lock1(gSendMutex);
+            while (!gSendQueue.empty()) gSendQueue.pop();
+            gSendQueuedFrames = 0;
+        }
+        {
+            std::lock_guard<std::mutex> lock2(gPlayMutex);
+            while (!gPlayQueue.empty()) gPlayQueue.pop();
+            gPlayQueuedFrames = 0;
+        }
     }
 
     WSACleanup();
